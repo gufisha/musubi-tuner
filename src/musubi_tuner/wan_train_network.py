@@ -10,6 +10,11 @@ from accelerate import Accelerator
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_WAN, ARCHITECTURE_WAN_FULL, load_video
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
+from musubi_tuner.modules.convrot_int8 import (
+    convrot_int8_state_summary,
+    resolve_convrot_int8_backend,
+    validate_rotation_size,
+)
 from musubi_tuner.hv_generate_video import resize_image_to_bucket
 from musubi_tuner.hv_train_network import (
     DiTOutput,
@@ -58,6 +63,23 @@ class WanNetworkTrainer(NetworkTrainer):
         self._control_training = self.config.is_fun_control
 
         self.dit_dtype = detect_wan_sd_dtype(args.dit)
+
+        if args.convrot_int8_allow_bf16_fallback and not args.convrot_int8_base:
+            raise ValueError("--convrot_int8_allow_bf16_fallback requires --convrot_int8_base")
+
+        if args.convrot_int8_base:
+            if args.fp8_base or args.fp8_scaled:
+                raise ValueError("--convrot_int8_base cannot be combined with --fp8_base or --fp8_scaled")
+            if args.base_weights:
+                raise ValueError("--base_weights merging is not supported with --convrot_int8_base")
+            if args.compile:
+                raise ValueError("torch.compile is not supported by the ConvRot INT8 v1 training path")
+            validate_rotation_size(args.convrot_int8_rotation_size)
+            if self.dit_dtype.itemsize == 1:
+                raise ValueError(
+                    "--convrot_int8_base requires an FP16/BF16/FP32 WAN checkpoint; "
+                    f"the supplied checkpoint is already quantized as {self.dit_dtype}"
+                )
 
         if self.dit_dtype == torch.float16:
             assert args.mixed_precision in ["fp16", "no"], "DiT weights are in fp16, mixed precision must be fp16 or no"
@@ -471,6 +493,14 @@ class WanNetworkTrainer(NetworkTrainer):
         loading_device: str,
         dit_weight_dtype: Optional[torch.dtype],
     ):
+        convrot_backend = None
+        if args.convrot_int8_base:
+            convrot_backend = resolve_convrot_int8_backend(
+                accelerator.device,
+                allow_bf16_fallback=args.convrot_int8_allow_bf16_fallback,
+            )
+            self.convrot_int8_backend = convrot_backend
+
         model = load_wan_model(
             self.config,
             accelerator.device,
@@ -481,6 +511,9 @@ class WanNetworkTrainer(NetworkTrainer):
             dit_weight_dtype,
             args.fp8_scaled,
             disable_numpy_memmap=args.disable_numpy_memmap,
+            convrot_int8=args.convrot_int8_base,
+            convrot_int8_rotation_size=args.convrot_int8_rotation_size,
+            convrot_int8_backend=convrot_backend,
         )
         if args.force_v2_1_time_embedding:
             model.set_time_embedding_v2_1(True)
@@ -498,6 +531,9 @@ class WanNetworkTrainer(NetworkTrainer):
                 dit_weight_dtype,
                 args.fp8_scaled,
                 disable_numpy_memmap=args.disable_numpy_memmap,
+                convrot_int8=args.convrot_int8_base,
+                convrot_int8_rotation_size=args.convrot_int8_rotation_size,
+                convrot_int8_backend=convrot_backend,
             )
             if args.force_v2_1_time_embedding:
                 model_high_noise.set_time_embedding_v2_1(True)
@@ -520,6 +556,29 @@ class WanNetworkTrainer(NetworkTrainer):
             self.next_model_is_high_noise = False
 
         return model
+
+    def on_transformer_loaded(self, args, accelerator, transformer):
+        if args.convrot_int8_base:
+            summary = convrot_int8_state_summary(transformer)
+            logger.info(
+                "ConvRot INT8 WAN state: layers=%d, weight_bytes=%d, scale_bytes=%d, backend=%s",
+                summary["layers"],
+                summary["weight_bytes"],
+                summary["scale_bytes"],
+                self.convrot_int8_backend,
+            )
+
+    def extra_metadata(self, args: argparse.Namespace) -> dict:
+        if not args.convrot_int8_base:
+            return {}
+        return {
+            "ss_convrot_int8_base": True,
+            "ss_convrot_int8_rotation_size": args.convrot_int8_rotation_size,
+            "ss_convrot_int8_backend": self.convrot_int8_backend,
+            "ss_convrot_int8_torch_version": torch.__version__,
+            "ss_convrot_int8_cuda_version": str(torch.version.cuda),
+            "ss_convrot_int8_device": torch.cuda.get_device_name() if torch.cuda.is_available() else str(torch.device("cpu")),
+        }
 
     def compile_transformer(self, args, transformer):
         transformer: WanModel = transformer
@@ -722,6 +781,22 @@ def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     """Wan2.1/2.2 specific parser setup"""
     parser.add_argument("--task", type=str, default="t2v-14B", choices=list(WAN_CONFIGS.keys()), help="The task to run.")
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
+    parser.add_argument(
+        "--convrot_int8_base",
+        action="store_true",
+        help="experimentally quantize eligible frozen WAN block Linear weights with ConvRot W8A8",
+    )
+    parser.add_argument(
+        "--convrot_int8_rotation_size",
+        type=int,
+        default=256,
+        help="requested regular-Hadamard rotation size (power of four, at least 16; default: 256)",
+    )
+    parser.add_argument(
+        "--convrot_int8_allow_bf16_fallback",
+        action="store_true",
+        help="explicitly allow dequantized BF16/FP16 compute when the native CUDA INT8 probe fails",
+    )
     parser.add_argument("--t5", type=str, default=None, help="text encoder (T5) checkpoint path")
     parser.add_argument("--fp8_t5", action="store_true", help="use fp8 for Text Encoder model")
     parser.add_argument(

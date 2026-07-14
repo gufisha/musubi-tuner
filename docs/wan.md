@@ -162,6 +162,10 @@ VRAMが限られているシステム（約16GB未満）の場合は、T5をfp8�
 
 ## Training / 学習
 
+An experimental ConvRot W8A8 base-weight mode is documented separately in
+[WAN ConvRot INT8 training](./wan_convrot_int8.md). It is intended for standard LoRA training from full-precision
+WAN checkpoints and is mutually exclusive with the FP8 base-weight modes.
+
 ### Training
 
 Start training using the following command (input as a single line):

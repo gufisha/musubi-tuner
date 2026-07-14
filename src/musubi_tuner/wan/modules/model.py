@@ -22,6 +22,7 @@ from musubi_tuner.wan.modules.attention import flash_attention
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
+from musubi_tuner.modules.convrot_int8 import apply_convrot_int8_monkey_patch, load_safetensors_with_convrot_int8
 
 __all__ = ["WanModel"]
 
@@ -989,6 +990,9 @@ def load_wan_model(
     lora_multipliers: Optional[List[float]] = None,
     use_scaled_mm: bool = False,
     disable_numpy_memmap: bool = False,
+    convrot_int8: bool = False,
+    convrot_int8_rotation_size: int = 256,
+    convrot_int8_backend: Optional[str] = None,
 ) -> WanModel:
     """
     Load a WAN model from the specified checkpoint.
@@ -1007,9 +1011,18 @@ def load_wan_model(
         lora_multipliers (Optional[List[float]]): LoRA multipliers for the weights, if any.
         use_scaled_mm (bool): Whether to use scaled matrix multiplication for fp8.
         disable_numpy_memmap (bool): Whether to disable numpy memmap when loading weights.
+        convrot_int8 (bool): Whether to convert eligible frozen WAN block Linears to ConvRot W8A8.
+        convrot_int8_rotation_size (int): Requested regular-Hadamard block size.
+        convrot_int8_backend (Optional[str]): Backend selected by the pre-load CUDA runtime probe.
     """
-    # dit_weight_dtype is None for fp8_scaled
+    # dit_weight_dtype is None for fp8_scaled. ConvRot starts from a normal
+    # fp16/bf16 checkpoint and uses dit_weight_dtype for non-quantized weights.
+    assert not (fp8_scaled and convrot_int8), "FP8 scaled and ConvRot INT8 are mutually exclusive"
     assert (not fp8_scaled and dit_weight_dtype is not None) or (fp8_scaled and dit_weight_dtype is None)
+    if convrot_int8:
+        assert convrot_int8_backend is not None, "ConvRot INT8 backend must be resolved before model loading"
+        if lora_weights_list:
+            raise ValueError("Loading and merging LoRA weights during ConvRot conversion is not supported")
 
     device = torch.device(device)
     loading_device = torch.device(loading_device)
@@ -1039,17 +1052,29 @@ def load_wan_model(
     # load model weights with dynamic fp8 optimization and LoRA merging if needed
     logger.info(f"Loading DiT model from {dit_path}, device={loading_device}")
 
-    sd = load_safetensors_with_lora_and_fp8(
-        model_files=dit_path,
-        lora_weights_list=lora_weights_list,
-        lora_multipliers=lora_multipliers,
-        fp8_optimization=fp8_scaled,
-        calc_device=device,
-        move_to_device=(loading_device == device),
-        target_keys=FP8_OPTIMIZATION_TARGET_KEYS,
-        exclude_keys=FP8_OPTIMIZATION_EXCLUDE_KEYS,
-        disable_numpy_memmap=disable_numpy_memmap,
-    )
+    if convrot_int8:
+        sd = load_safetensors_with_convrot_int8(
+            model_files=dit_path,
+            calc_device=device,
+            loading_device=loading_device,
+            weight_dtype=dit_weight_dtype,
+            requested_rotation_size=convrot_int8_rotation_size,
+            target_keys=FP8_OPTIMIZATION_TARGET_KEYS,
+            exclude_keys=FP8_OPTIMIZATION_EXCLUDE_KEYS,
+            disable_numpy_memmap=disable_numpy_memmap,
+        )
+    else:
+        sd = load_safetensors_with_lora_and_fp8(
+            model_files=dit_path,
+            lora_weights_list=lora_weights_list,
+            lora_multipliers=lora_multipliers,
+            fp8_optimization=fp8_scaled,
+            calc_device=device,
+            move_to_device=(loading_device == device),
+            target_keys=FP8_OPTIMIZATION_TARGET_KEYS,
+            exclude_keys=FP8_OPTIMIZATION_EXCLUDE_KEYS,
+            disable_numpy_memmap=disable_numpy_memmap,
+        )
 
     # remove "model.diffusion_model." prefix: 1.3B model has this prefix
     for key in list(sd.keys()):
@@ -1064,6 +1089,9 @@ def load_wan_model(
             logger.info(f"Moving weights to {loading_device}")
             for key in sd.keys():
                 sd[key] = sd[key].to(loading_device)
+
+    if convrot_int8:
+        apply_convrot_int8_monkey_patch(model, sd, convrot_int8_backend)
 
     info = model.load_state_dict(sd, strict=True, assign=True)
     if dit_weight_dtype is not None:
