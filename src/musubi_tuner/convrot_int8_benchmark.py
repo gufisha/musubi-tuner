@@ -14,6 +14,7 @@ from musubi_tuner.modules.convrot_int8 import (
     CONVROT_INT8_ROTATION_BUFFER,
     CONVROT_INT8_SCALE_BUFFER,
     apply_convrot_int8_monkey_patch,
+    convrot_int8_forward_kernel_summary,
     effective_rotation_size,
     quantize_int8_rows,
     resolve_convrot_int8_backend,
@@ -96,6 +97,9 @@ def run_benchmark(args) -> dict:
     for _ in range(args.warmup):
         one_step()
     synchronize(device)
+    if device.type == "cuda":
+        # Exclude Triton compilation/autotuning from the steady-state peak.
+        torch.cuda.reset_peak_memory_stats(device)
 
     samples_ms = []
     for _ in range(args.iterations):
@@ -121,6 +125,7 @@ def run_benchmark(args) -> dict:
         "median_ms": statistics.median(samples_ms),
         "p95_ms": percentile(samples_ms, 0.95),
         "peak_memory_bytes": peak_memory,
+        "forward_kernel": convrot_int8_forward_kernel_summary(),
     }
 
 

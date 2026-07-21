@@ -50,6 +50,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+import musubi_tuner.modules.convrot_int8_kernels as convrot_int8_kernels
 from musubi_tuner.utils.device_utils import clean_memory_on_device, synchronize_device
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, get_split_weight_filenames
 
@@ -57,6 +58,9 @@ logger = logging.getLogger(__name__)
 
 CONVROT_INT8_BACKEND_NATIVE = "native_int8"
 CONVROT_INT8_BACKEND_FALLBACK = "bf16_fallback"
+CONVROT_INT8_FORWARD_TRITON = "triton_fused"
+CONVROT_INT8_FORWARD_TORCH = "torch_int_mm"
+CONVROT_INT8_FORWARD_MIXED = "mixed"
 CONVROT_INT8_SCALE_BUFFER = "convrot_int8_scale"
 CONVROT_INT8_ROTATION_BUFFER = "convrot_int8_rotation"
 
@@ -64,6 +68,8 @@ _hadamard_cache: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
 _triton_ok: Optional[bool] = None
 _int8_kernels = None
 _probe_cache: dict[str, "ConvRotInt8Probe"] = {}
+_forward_kernel_cache: dict[tuple, str] = {}
+_forward_kernel_fallback_reasons: dict[tuple, str] = {}
 
 
 @dataclass(frozen=True)
@@ -307,6 +313,152 @@ def _int8_epilogue(
     return output.to(out_dtype)
 
 
+def _forward_kernel_key(
+    activation_codes: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    rows: int,
+    out_dtype: torch.dtype,
+) -> tuple:
+    bias_signature = None
+    if bias is not None:
+        bias_signature = (str(bias.dtype), tuple(bias.shape), tuple(bias.stride()))
+    return (
+        str(activation_codes.device),
+        str(out_dtype),
+        rows,
+        weight.shape[0],
+        weight.shape[1],
+        tuple(activation_codes.stride()),
+        tuple(weight.stride()),
+        bias_signature,
+    )
+
+
+def reset_convrot_int8_forward_kernel_state() -> None:
+    """Reset per-process fused/legacy shape decisions (primarily for tests)."""
+    _forward_kernel_cache.clear()
+    _forward_kernel_fallback_reasons.clear()
+
+
+def convrot_int8_forward_kernel_summary() -> dict[str, Union[str, int]]:
+    """Return which native forward implementation has actually executed."""
+    selected = set(_forward_kernel_cache.values())
+    if not selected:
+        kernel = "uninitialized"
+    elif selected == {CONVROT_INT8_FORWARD_TRITON}:
+        kernel = CONVROT_INT8_FORWARD_TRITON
+    elif selected == {CONVROT_INT8_FORWARD_TORCH}:
+        kernel = CONVROT_INT8_FORWARD_TORCH
+    else:
+        kernel = CONVROT_INT8_FORWARD_MIXED
+    return {
+        "kernel": kernel,
+        "fused_shapes": sum(value == CONVROT_INT8_FORWARD_TRITON for value in _forward_kernel_cache.values()),
+        "legacy_shapes": sum(value == CONVROT_INT8_FORWARD_TORCH for value in _forward_kernel_cache.values()),
+        "fallback_shapes": len(_forward_kernel_fallback_reasons),
+    }
+
+
+def _legacy_int8_matmul_dequant(
+    activation_codes: torch.Tensor,
+    activation_scales: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales_u8: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    rows: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    i32 = torch._int_mm(activation_codes, weight.t())
+    return _int8_epilogue(
+        i32[:rows],
+        activation_scales[:rows],
+        weight_scales_u8.view(torch.float32),
+        bias,
+        out_dtype,
+    )
+
+
+def _native_int8_matmul_dequant(
+    activation_codes: torch.Tensor,
+    activation_scales: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales_u8: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    rows: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Prefer fused Triton and cache a shape-specific legacy fallback."""
+    key = _forward_kernel_key(activation_codes, weight, bias, rows, out_dtype)
+    selected = _forward_kernel_cache.get(key)
+
+    if selected != CONVROT_INT8_FORWARD_TORCH and convrot_int8_kernels.HAS_TRITON:
+        first_fused_launch = selected is None
+        try:
+            output = convrot_int8_kernels.fused_int8_matmul_dequant(
+                activation_codes,
+                weight,
+                activation_scales,
+                weight_scales_u8.view(torch.float32),
+                bias,
+                rows,
+                out_dtype,
+            )
+            if first_fused_launch:
+                # Surface compile/launch errors during the one-time selection,
+                # outside the timed steady-state path.
+                torch.cuda.synchronize(activation_codes.device)
+                _forward_kernel_cache[key] = CONVROT_INT8_FORWARD_TRITON
+                logger.info(
+                    "ConvRot INT8 forward selected %s: device=%s dtype=%s M=%d N=%d K=%d",
+                    CONVROT_INT8_FORWARD_TRITON,
+                    activation_codes.device,
+                    out_dtype,
+                    rows,
+                    weight.shape[0],
+                    weight.shape[1],
+                )
+            return output
+        except Exception as exc:
+            if not convrot_int8_kernels.is_recoverable_triton_error(exc):
+                raise
+            reason = f"{type(exc).__name__}: {exc}"
+            _forward_kernel_cache[key] = CONVROT_INT8_FORWARD_TORCH
+            _forward_kernel_fallback_reasons[key] = reason
+            logger.warning(
+                "ConvRot INT8 fused forward failed; using %s for this shape: device=%s dtype=%s M=%d N=%d K=%d reason=%s",
+                CONVROT_INT8_FORWARD_TORCH,
+                activation_codes.device,
+                out_dtype,
+                rows,
+                weight.shape[0],
+                weight.shape[1],
+                reason,
+            )
+    elif selected is None:
+        _forward_kernel_cache[key] = CONVROT_INT8_FORWARD_TORCH
+        _forward_kernel_fallback_reasons[key] = "Triton fused kernel is unavailable"
+        logger.warning(
+            "ConvRot INT8 fused forward is unavailable; using %s: device=%s dtype=%s M=%d N=%d K=%d",
+            CONVROT_INT8_FORWARD_TORCH,
+            activation_codes.device,
+            out_dtype,
+            rows,
+            weight.shape[0],
+            weight.shape[1],
+        )
+
+    return _legacy_int8_matmul_dequant(
+        activation_codes,
+        activation_scales,
+        weight,
+        weight_scales_u8,
+        bias,
+        rows,
+        out_dtype,
+    )
+
+
 @torch.library.custom_op("musubi_tuner::convrot_int8_linear_ste", mutates_args=())
 def _int8_linear_ste_op(
     x: torch.Tensor,
@@ -317,9 +469,14 @@ def _int8_linear_ste_op(
 ) -> torch.Tensor:
     rows = x.shape[0]
     activation_codes, activation_scales = _int8_act_quant_padded(x)
-    i32 = torch._int_mm(activation_codes, weight.t())
-    return _int8_epilogue(
-        i32[:rows], activation_scales[:rows], weight_scales_u8.view(torch.float32), bias, getattr(torch, out_dtype)
+    return _native_int8_matmul_dequant(
+        activation_codes,
+        activation_scales,
+        weight,
+        weight_scales_u8,
+        bias,
+        rows,
+        getattr(torch, out_dtype),
     )
 
 
@@ -440,12 +597,13 @@ def convrot_int8_linear_forward(module: nn.Linear, x: torch.Tensor) -> torch.Ten
         else:
             rows = x_rotated.shape[0]
             activation_codes, activation_scales = _int8_act_quant_padded(x_rotated)
-            i32 = torch._int_mm(activation_codes, module.weight.t())
-            output = _int8_epilogue(
-                i32[:rows],
-                activation_scales[:rows],
-                _scale_buffer(module).view(torch.float32),
+            output = _native_int8_matmul_dequant(
+                activation_codes,
+                activation_scales,
+                module.weight,
+                _scale_buffer(module),
                 module.bias,
+                rows,
                 x.dtype,
             )
     elif backend == CONVROT_INT8_BACKEND_FALLBACK:

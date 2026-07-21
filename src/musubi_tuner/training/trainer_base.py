@@ -1298,6 +1298,14 @@ class NetworkTrainer:
         """
         return {}
 
+    def update_metadata_before_save(self, args: argparse.Namespace, metadata: dict) -> None:
+        """Refresh runtime-derived metadata immediately before a checkpoint save.
+
+        Metadata is initially assembled before the first training forward. A
+        subclass can use this hook for diagnostics that are known only after
+        execution has started. Values assigned here must be strings.
+        """
+
     def extra_step_logs(self, args: argparse.Namespace, logs: dict) -> dict:
         """Returns additional log entries to merge into the per-step log payload.
 
@@ -1943,6 +1951,7 @@ class NetworkTrainer:
             metadata["ss_training_finished_at"] = str(time.time())
             metadata["ss_steps"] = str(steps)
             metadata["ss_epoch"] = str(epoch_no)
+            self.update_metadata_before_save(args, metadata)
 
             metadata_to_save = minimum_metadata if args.no_metadata else metadata
 

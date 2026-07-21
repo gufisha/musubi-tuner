@@ -11,7 +11,9 @@ from accelerate import Accelerator
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_WAN, ARCHITECTURE_WAN_FULL, load_video
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.modules.convrot_int8 import (
+    convrot_int8_forward_kernel_summary,
     convrot_int8_state_summary,
+    reset_convrot_int8_forward_kernel_state,
     resolve_convrot_int8_backend,
     validate_rotation_size,
 )
@@ -68,6 +70,7 @@ class WanNetworkTrainer(NetworkTrainer):
             raise ValueError("--convrot_int8_allow_bf16_fallback requires --convrot_int8_base")
 
         if args.convrot_int8_base:
+            reset_convrot_int8_forward_kernel_state()
             if args.fp8_base or args.fp8_scaled:
                 raise ValueError("--convrot_int8_base cannot be combined with --fp8_base or --fp8_scaled")
             if args.base_weights:
@@ -571,14 +574,20 @@ class WanNetworkTrainer(NetworkTrainer):
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         if not args.convrot_int8_base:
             return {}
+        forward_summary = convrot_int8_forward_kernel_summary()
         return {
             "ss_convrot_int8_base": True,
             "ss_convrot_int8_rotation_size": args.convrot_int8_rotation_size,
             "ss_convrot_int8_backend": self.convrot_int8_backend,
+            "ss_convrot_int8_forward_kernel": forward_summary["kernel"],
             "ss_convrot_int8_torch_version": torch.__version__,
             "ss_convrot_int8_cuda_version": str(torch.version.cuda),
             "ss_convrot_int8_device": torch.cuda.get_device_name() if torch.cuda.is_available() else str(torch.device("cpu")),
         }
+
+    def update_metadata_before_save(self, args: argparse.Namespace, metadata: dict) -> None:
+        if args.convrot_int8_base:
+            metadata["ss_convrot_int8_forward_kernel"] = str(convrot_int8_forward_kernel_summary()["kernel"])
 
     def compile_transformer(self, args, transformer):
         transformer: WanModel = transformer
